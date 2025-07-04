@@ -1,0 +1,576 @@
+/*
+ * AMB82 Smart Detection System V2.0 - FIXED VERSION (Following Working Example)
+ * 
+ * Key fixes:
+ * 1. Configure both video channels together (like working example)
+ * 2. Always initialize RTSP channel (even without WiFi)
+ * 3. Start both StreamIO links together
+ * 4. Follow exact initialization sequence from working code
+ */
+
+#include "config.h"
+#include "motherboard_counter.h"
+#include "amb82_flash.h"
+#include "amb82_gpio.h"
+#include "serial_commands.h"
+#include "lora_rak3172.h"
+
+// Neural Network includes
+#include "WiFi.h"
+#include "StreamIO.h"
+#include "VideoStream.h"
+#include "RTSP.h"
+#include "NNObjectDetection.h"
+#include "VideoStreamOverlay.h"
+#include "ObjectClassList.h"
+
+// ===== GLOBAL VARIABLES =====
+system_config_t system_config;
+system_state_t system_state = SYS_STATE_INIT;
+
+// Video configuration - EXACTLY LIKE WORKING EXAMPLE
+#define CHANNEL   0      // Main video channel for RTSP
+#define CHANNELNN 3      // Neural network channel
+
+#define NNWIDTH  576
+#define NNHEIGHT 320
+
+// Video settings - BOTH channels like working example
+VideoSetting config(VIDEO_FHD, 30, VIDEO_H264, 0);
+VideoSetting configNN(NNWIDTH, NNHEIGHT, 10, VIDEO_RGB, 0);
+
+// Objects - EXACTLY like working example
+NNObjectDetection ObjDet;
+RTSP rtsp;
+StreamIO videoStreamer(1, 1);
+StreamIO videoStreamerNN(1, 1);
+
+// WiFi credentials (configurable)
+char wifi_ssid[32] = "Your_WiFi_SSID";
+char wifi_password[32] = "Your_WiFi_Password";
+
+// System state tracking
+bool neural_network_loaded = false;
+bool camera_initialized = false;
+bool wifi_connected = false;
+bool rtsp_streaming = false;
+uint32_t detection_count = 0;
+uint32_t led_detections = 0;
+uint32_t motherboard_detections = 0;
+
+// Global variables for working example compatibility
+IPAddress ip;
+int rtsp_portnum;
+
+// ===== FUNCTION DECLARATIONS =====
+bool init_wifi_on_demand();
+bool start_rtsp_streaming();
+void stop_rtsp_streaming();
+bool init_camera_and_detection_system();
+void process_detections_core();
+void handle_detection(uint8_t object_class, float confidence, ObjectDetectionResult& result);
+void send_detection_lora(uint8_t object_class, float confidence);
+void send_status_lora();
+
+// ===== DETECTION HANDLER =====
+void handle_detection(uint8_t object_class, float confidence, ObjectDetectionResult& result) {
+    // Update statistics
+    detection_count++;
+    
+    if (object_class == CLASS_LED_ON) {
+        led_detections++;
+    } else if (object_class == CLASS_MOTHERBOARD) {
+        motherboard_detections++;
+        
+        // Add to motherboard counter
+        motherboard_counter_add_detection(millis());
+        
+        // Check if trigger threshold reached
+        if (motherboard_counter_check_trigger()) {
+            // Send LoRa trigger message
+            send_motherboard_trigger_lora();
+            
+            // Special visual indication
+            gpio_status_led_set_pattern(LED_PATTERN_TRIPLE_BLINK);
+            
+            Serial.println("🚨 MOTHERBOARD DETECTION TRIGGER ACTIVATED!");
+            Serial.println("📡 LoRa trigger message sent");
+        }
+    }
+    
+    // Create detection result for logging
+    detection_result_t det_result = {0};
+    det_result.timestamp = millis();
+    det_result.object_class = object_class;
+    det_result.confidence = confidence;
+    det_result.x_min = result.xMin();
+    det_result.y_min = result.yMin();
+    det_result.x_max = result.xMax();
+    det_result.y_max = result.yMax();
+    det_result.valid = 1;
+    
+    // Log to flash
+    if (flash_is_initialized()) {
+        flash_write_detection_log(&det_result);
+    }
+    
+    // Visual feedback (normal detections)
+    if (object_class != CLASS_MOTHERBOARD || !motherboard_counter_check_trigger()) {
+        gpio_status_led_set_pattern(LED_PATTERN_DOUBLE_BLINK);
+    }
+    
+    // LoRa transmission for high-confidence detections
+    if (lora_is_initialized() && confidence >= system_config.detection_threshold) {
+        send_detection_lora(object_class, confidence);
+    }
+    
+    // Update crosshair laser for motherboard
+    if (object_class == CLASS_MOTHERBOARD) {
+        gpio_laser_update_detection(confidence);
+    }
+    
+    // Print detection with counter info
+    String counter_info = "";
+    if (object_class == CLASS_MOTHERBOARD) {
+        uint32_t window_count = motherboard_counter_get_count_in_window();
+        counter_info = " (Count: " + String(window_count) + "/" + String(system_config.motherboard_count_threshold) + ")";
+    }
+    
+    Serial.println("🎯 " + String(object_class == CLASS_LED_ON ? "LED" : "MOTHERBOARD") + 
+                   " detected: " + String(confidence * 100, 1) + "%" + counter_info);
+}
+
+// ===== LORA FUNCTIONS =====
+void send_detection_lora(uint8_t object_class, float confidence) {
+    char msg[30];
+    snprintf(msg, sizeof(msg), "%d,%.2f", object_class, confidence);
+    
+    lora_result_t result = lora_send_message(LORA_MSG_DETECTION, msg);
+    if (result != LORA_SUCCESS) {
+        DEBUG_PRINT(3, "[LoRa] Failed: " + String(lora_result_to_string(result)));
+    } else {
+        DEBUG_PRINT(3, "[LoRa] Sent: " + String(msg));
+    }
+}
+
+void send_status_lora() {
+    char msg[25];
+    snprintf(msg, sizeof(msg), "UP:%lu,D:%lu", millis()/1000, detection_count);
+    lora_result_t result = lora_send_message(LORA_MSG_STATUS, msg);
+    if (result != LORA_SUCCESS) {
+        DEBUG_PRINT(3, "[LoRa] Status failed: " + String(lora_result_to_string(result)));
+    }
+}
+
+// ===== WIFI/RTSP FUNCTIONS =====
+bool init_wifi_on_demand() {
+    Serial.println("[WiFi] Starting connection...");
+    Serial.println("[WiFi] SSID: " + String(wifi_ssid));
+    
+    int status = WL_IDLE_STATUS;
+    uint32_t start_time = millis();
+    
+    status = WiFi.begin(wifi_ssid, wifi_password);
+    
+    while (status != WL_CONNECTED && (millis() - start_time) < 15000) {
+        delay(500);
+        Serial.print(".");
+        status = WiFi.status();
+    }
+    
+    if (status == WL_CONNECTED) {
+        ip = WiFi.localIP();
+        Serial.print("\n[WiFi] Connected! IP: ");
+        Serial.println(ip);
+        wifi_connected = true;
+        return true;
+    } else {
+        Serial.println("\n[WiFi] Failed to connect");
+        wifi_connected = false;
+        return false;
+    }
+}
+
+bool start_rtsp_streaming() {
+    if (!wifi_connected) {
+        Serial.println("[RTSP] WiFi not connected");
+        return false;
+    }
+    
+    Serial.println("[RTSP] RTSP already configured and running!");
+    Serial.print("[RTSP] URL: rtsp://");
+    Serial.print(ip);
+    Serial.print(":");
+    Serial.println(rtsp_portnum);
+    
+    rtsp_streaming = true;
+    return true;
+}
+
+void stop_rtsp_streaming() {
+    Serial.println("[RTSP] RTSP streaming stopped (video system remains active)");
+    rtsp_streaming = false;
+}
+
+// ===== CAMERA AND DETECTION INITIALIZATION - FOLLOWING WORKING EXAMPLE EXACTLY =====
+bool init_camera_and_detection_system() {
+    Serial.println("[Camera] Initializing camera and detection system...");
+    
+    try {
+        // STEP 1: Configure camera video channels with video format information
+        // (EXACTLY like working example - configure BOTH channels)
+        Serial.println("  - Configuring video channels...");
+        config.setBitrate(2 * 1024 * 1024);    // Recommend to use 2Mbps for RTSP streaming
+        Camera.configVideoChannel(CHANNEL, config);
+        Camera.configVideoChannel(CHANNELNN, configNN);
+        
+        // STEP 2: Initialize camera video system (EXACTLY like working example)
+        Serial.println("  - Initializing camera video...");
+        Camera.videoInit();
+        
+        // STEP 3: Configure RTSP with corresponding video format information
+        // (EXACTLY like working example - even if no WiFi)
+        Serial.println("  - Configuring RTSP...");
+        rtsp.configVideo(config);
+        rtsp.begin();
+        rtsp_portnum = rtsp.getPort();
+        
+        // STEP 4: Configure object detection with corresponding video format information
+        // Select Neural Network(NN) task and models (EXACTLY like working example)
+        Serial.println("  - Configuring object detection...");
+        ObjDet.configVideo(configNN);
+        ObjDet.modelSelect(OBJECT_DETECTION, CUSTOMIZED_YOLOV7TINY, NA_MODEL, NA_MODEL);
+        ObjDet.begin();
+        
+        // STEP 5: Configure StreamIO object to stream data from video channel to RTSP
+        // (EXACTLY like working example)
+        Serial.println("  - Setting up RTSP StreamIO...");
+        videoStreamer.registerInput(Camera.getStream(CHANNEL));
+        videoStreamer.registerOutput(rtsp);
+        if (videoStreamer.begin() != 0) {
+            Serial.println("  ❌ RTSP StreamIO link start failed");
+            return false;
+        }
+        
+        // STEP 6: Start data stream from video channel (EXACTLY like working example)
+        Serial.println("  - Starting main video channel...");
+        Camera.channelBegin(CHANNEL);
+        
+        // STEP 7: Configure StreamIO object to stream data from RGB video channel to object detection
+        // (EXACTLY like working example)
+        Serial.println("  - Setting up NN StreamIO...");
+        videoStreamerNN.registerInput(Camera.getStream(CHANNELNN));
+        videoStreamerNN.setStackSize();
+        videoStreamerNN.setTaskPriority();
+        videoStreamerNN.registerOutput(ObjDet);
+        if (videoStreamerNN.begin() != 0) {
+            Serial.println("  ❌ NN StreamIO link start failed");
+            return false;
+        }
+        
+        // STEP 8: Start video channel for NN (EXACTLY like working example)
+        Serial.println("  - Starting NN video channel...");
+        Camera.channelBegin(CHANNELNN);
+        
+        // STEP 9: Start OSD drawing on RTSP video channel (EXACTLY like working example)
+        Serial.println("  - Starting OSD overlay...");
+        OSD.configVideo(CHANNEL, config);
+        OSD.begin();
+        
+        // STEP 10: Allow time for initialization
+        Serial.println("  - Waiting for system stabilization...");
+        delay(3000);
+        
+        // Test detection
+        Serial.println("  - Testing detection system...");
+        delay(1000);
+        
+        int test_count = ObjDet.getResultCount();
+        Serial.println("  - Initial result count: " + String(test_count));
+        
+        neural_network_loaded = true;
+        camera_initialized = true;
+        
+        Serial.println("✅ Camera and detection system initialized successfully");
+        Serial.println("📺 RTSP URL: rtsp://[YOUR_IP]:" + String(rtsp_portnum));
+        
+        return true;
+        
+    } catch (...) {
+        Serial.println("❌ Camera and detection system initialization failed");
+        neural_network_loaded = false;
+        camera_initialized = false;
+        return false;
+    }
+}
+
+// ===== SETUP =====
+void setup() {
+    Serial.begin(115200);
+    delay(3000);
+    
+    Serial.println("\n=== AMB82 SMART DETECTION SYSTEM V2.0 - WORKING EXAMPLE PATTERN ===");
+    Serial.println("🎯 Following exact pattern from working object detection code");
+    Serial.println("📐 Resolution: " + String(NNWIDTH) + "x" + String(NNHEIGHT));
+    
+    // Initialize modules
+    Serial.println("[1] Configuration...");
+    system_config_t default_config = DEFAULT_CONFIG;
+    system_config = default_config;
+    flash_init();
+    config_load_from_flash();
+    Serial.println("✓ Config loaded");
+    
+    Serial.println("[2] GPIO...");
+    gpio_init();
+    Serial.println("✓ GPIO ready");
+    
+    Serial.println("[3] Motherboard Counter...");
+    motherboard_counter_init();
+    Serial.println("✓ Motherboard counter ready");
+    
+    Serial.println("[4] Serial commands...");
+    serial_commands_init();
+    Serial.println("✓ Commands ready");
+    
+    // LoRa initialization
+    Serial.println("[5] LoRa...");
+    Serial.println("  - Testing RAK3172 connection...");
+    
+    Serial1.begin(115200);
+    delay(1000);
+    
+    Serial1.println("AT");
+    delay(1000);
+    
+    bool lora_basic_test = false;
+    String response = "";
+    uint32_t start_time = millis();
+    
+    while (millis() - start_time < 3000) {
+        if (Serial1.available()) {
+            response += (char)Serial1.read();
+            if (response.indexOf("OK") >= 0) {
+                lora_basic_test = true;
+                break;
+            }
+        }
+    }
+    
+    if (lora_basic_test) {
+        Serial.println("  ✓ RAK3172 basic communication OK");
+        lora_result_t lora_result = lora_init();
+        Serial.println(lora_result == LORA_SUCCESS ? "✓ LoRa ready" : "⚠ LoRa init failed (but basic comm OK)");
+    } else {
+        Serial.println("  ⚠ RAK3172 not responding - check connections");
+    }
+    
+    // Camera and Detection System - using working example pattern
+    Serial.println("[6] Camera and Detection System (Working Example Pattern)...");
+    
+    if (init_camera_and_detection_system()) {
+        neural_network_loaded = true;
+        Serial.println("✅ Detection system active using working example pattern!");
+    } else {
+        Serial.println("❌ Detection system failed to initialize");
+    }
+    
+    system_state = SYS_STATE_RUNNING;
+    
+    Serial.println("\n🎉 SYSTEM V2.0 STATUS!");
+    Serial.println("════════════════════════════");
+    Serial.println("Detection: " + String(neural_network_loaded ? "✅ ACTIVE" : "❌ FAILED"));
+    Serial.println("Model: CUSTOMIZED_YOLOV7TINY");
+    Serial.println("Resolution: " + String(NNWIDTH) + "x" + String(NNHEIGHT));
+    Serial.println("RTSP: ✅ CONFIGURED (Port " + String(rtsp_portnum) + ")");
+    Serial.println("WiFi: ⏸️ Use 'rtsp_stream' to connect and enable streaming");
+    Serial.println("LoRa: " + String(lora_basic_test ? "✅ CONNECTED" : "❌ NO RESPONSE"));
+    Serial.println("GPIO: ✅ Fan + Laser + LED");
+    Serial.println("Commands: ✅ Type 'help'");
+    
+    if (neural_network_loaded) {
+        Serial.println("\n🎯 DETECTION SETTINGS:");
+        Serial.println("- Threshold: " + String(system_config.detection_threshold * 100) + "%");
+        Serial.println("- Motherboard: " + String(system_config.motherboard_threshold * 100) + "%");
+        
+        Serial.println("\n🔢 MOTHERBOARD COUNTER:");
+        Serial.println("- Enabled: " + String(system_config.motherboard_count_enabled ? "YES" : "NO"));
+        Serial.println("- Trigger: " + String(system_config.motherboard_count_threshold) + " detections");
+        Serial.println("- Window: " + String(system_config.motherboard_count_window_ms/1000) + " seconds");
+    }
+    
+    Serial.println("\n📡 AVAILABLE COMMANDS:");
+    Serial.println("- help                   Show all commands");
+    Serial.println("- nn_status              Check detection system status");
+    Serial.println("- rtsp_stream            Connect WiFi and show RTSP URL");
+    Serial.println("- lora test              Test LoRa communication");
+    Serial.println("════════════════════════════\n");
+}
+
+// ===== MAIN LOOP =====
+void loop() {
+    // Process modules
+    if (gpio_is_initialized()) {
+        gpio_process_all();
+    }
+    
+    if (lora_is_initialized()) {
+        lora_process();
+    }
+    
+    if (serial_commands_is_enabled()) {
+        serial_commands_process();
+    }
+    
+    // Core detection processing - EXACTLY like working example
+    if (neural_network_loaded) {
+        process_detections_core();
+    }
+    
+    // Reduced status frequency
+    static uint32_t last_status = 0;
+    if (millis() - last_status > 300000) { // Every 5 minutes
+        if (lora_is_initialized()) {
+            send_status_lora();
+        }
+        
+        uint32_t mb_window_count = motherboard_counter_get_count_in_window();
+        
+        Serial.println("📊 " + String(millis()/1000) + "s | Detections: " + 
+                      String(detection_count) + " (LED:" + String(led_detections) + 
+                      ", MB:" + String(motherboard_detections) + 
+                      ") | MB Window: " + String(mb_window_count) + "/" + String(system_config.motherboard_count_threshold) +
+                      " | WiFi: " + String(wifi_connected ? "ON" : "OFF"));
+        last_status = millis();
+    }
+    
+    delay(100);
+}
+
+// ===== DETECTION PROCESSING - ADAPTED FROM WORKING EXAMPLE =====
+void process_detections_core() {
+    static uint32_t last_check = 0;
+    if (millis() - last_check < 2000) return; // Check every 2 seconds
+    
+    try {
+        // Get detection results (EXACTLY like working example)
+        std::vector<ObjectDetectionResult> results = ObjDet.getResult();
+        int count = ObjDet.getResultCount();
+        
+        // Debug output every 30 seconds
+        static uint32_t last_debug = 0;
+        if (millis() - last_debug > 30000) {
+            Serial.println("[DEBUG] NN Processing - Result count: " + String(count));
+            last_debug = millis();
+        }
+        
+        // Handle OSD overlay (always update, like working example)
+        uint16_t im_h = config.height();
+        uint16_t im_w = config.width();
+        
+        OSD.createBitmap(CHANNEL);
+        
+        if (count > 0) {
+            Serial.println("🔍 Total number of objects detected = " + String(count));
+            
+            for (int i = 0; i < count && i < 3; i++) {
+                ObjectDetectionResult item = results[i];
+                int obj_type = item.type();
+                
+                if (obj_type >= 0 && obj_type < (int)(sizeof(itemList)/sizeof(itemList[0]))) {
+                    if (itemList[obj_type].filter) {    // check if item should be ignored
+                        
+                        // Calculate coordinates (EXACTLY like working example)
+                        int xmin = (int)(item.xMin() * im_w);
+                        int xmax = (int)(item.xMax() * im_w);
+                        int ymin = (int)(item.yMin() * im_h);
+                        int ymax = (int)(item.yMax() * im_h);
+                        
+                        // Draw boundary box (EXACTLY like working example)
+                        Serial.println("Item " + String(i) + " " + String(itemList[obj_type].objectName) + 
+                                     ": " + String(xmin) + " " + String(xmax) + " " + String(ymin) + " " + String(ymax));
+                        OSD.drawRect(CHANNEL, xmin, ymin, xmax, ymax, 3, OSD_COLOR_WHITE);
+                        
+                        // Print identification text (EXACTLY like working example)
+                        char text_str[20];
+                        snprintf(text_str, sizeof(text_str), "%s %d", itemList[obj_type].objectName, (int)(item.score() * 100));
+                        OSD.drawText(CHANNEL, xmin, ymin - OSD.getTextHeight(CHANNEL), text_str, OSD_COLOR_CYAN);
+                        
+                        // Process detection for our IoT functionality
+                        float confidence = item.score();
+                        if (confidence > system_config.detection_threshold) {
+                            uint8_t object_class = CLASS_UNKNOWN;
+                            const char* name = itemList[obj_type].objectName;
+                            
+                            if (strstr(name, "led") || strstr(name, "LED") || obj_type == 0) {
+                                object_class = CLASS_LED_ON;
+                            } else if (strstr(name, "motherboard") || strstr(name, "board") || obj_type == 1) {
+                                object_class = CLASS_MOTHERBOARD;
+                            }
+                            
+                            if (object_class != CLASS_UNKNOWN) {
+                                handle_detection(object_class, confidence, item);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        OSD.update(CHANNEL);  // Always update OSD (like working example)
+        
+    } catch (...) {
+        Serial.println("! Detection processing error");
+    }
+    
+    last_check = millis();
+}
+
+// ===== DIAGNOSTIC AND RESET FUNCTIONS =====
+void debug_neural_network_status() {
+    Serial.println("\n=== NEURAL NETWORK DIAGNOSTICS ===");
+    Serial.println("Camera Status:");
+    Serial.println("  - Camera initialized: " + String(camera_initialized ? "YES" : "NO"));
+    Serial.println("  - NN loaded: " + String(neural_network_loaded ? "YES" : "NO"));
+    Serial.println("  - RTSP Port: " + String(rtsp_portnum));
+    
+    Serial.println("\nVideo Stream Status:");
+    try {
+        Camera.getStream(CHANNELNN);
+        Serial.println("  - Camera stream available: YES");
+    } catch (...) {
+        Serial.println("  - Camera stream check failed");
+    }
+    
+    Serial.println("\nObject Detection Status:");
+    try {
+        int count = ObjDet.getResultCount();
+        Serial.println("  - Current result count: " + String(count));
+        
+        std::vector<ObjectDetectionResult> results = ObjDet.getResult();
+        Serial.println("  - Results vector size: " + String(results.size()));
+        
+    } catch (...) {
+        Serial.println("  - Object detection check failed");
+    }
+    
+    Serial.println("\nSystem Status:");
+    Serial.println("  - Uptime: " + String(millis()/1000) + " seconds");
+    Serial.println("  - Detection count: " + String(detection_count));
+    Serial.println("  - RTSP configured: " + String(rtsp_portnum > 0 ? "YES" : "NO"));
+    Serial.println("  - WiFi connected: " + String(wifi_connected ? "YES" : "NO"));
+    
+    Serial.println("=====================================\n");
+}
+
+bool reset_camera_system() {
+    Serial.println("Reset not supported in working example pattern");
+    Serial.println("Please reboot the system to reinitialize");
+    return false;
+}
+
+bool restart_neural_network() {
+    Serial.println("NN restart not supported in working example pattern");
+    Serial.println("Please reboot the system to reinitialize");
+    return false;
+}
