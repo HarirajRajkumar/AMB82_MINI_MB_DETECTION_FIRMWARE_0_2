@@ -1,4 +1,5 @@
 # AMB82 Smart Detection System V0.2.0
+# AMB82 Smart Detection System V0.2.0 + Vandalism Protection
 
 A comprehensive IoT object detection system built on the Realtek AMB82-MINI platform featuring real-time neural network inference, LoRa communication, and advanced GPIO control capabilities.
 
